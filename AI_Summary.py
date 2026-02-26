@@ -54,6 +54,40 @@ CREDENTIALS_PATH = "credentials.json"
 CONFIG_FILE = "config.ini"
 
 # =====================================================
+# STRICT TARGET COLUMNS — only these will be written
+# =====================================================
+
+TARGET_COLUMNS = [
+    "SP ID",
+    "Name",
+    "City",
+    "Processed Date",
+    "Poornanga",
+    "High Skill",
+    "Tamil Speaking",
+    "Tier City",
+    "Medical Professional",
+    "Volunteer Experience",
+    "Isha Family Connect",
+    "English Proficiency",
+    "Other Languages",
+    "Prestigious Institution",
+    "Undergrad/Postgrad",
+    "Specialization",
+    "Psychological Concerns",
+    "Medical Concerns",
+    "Highlights to SP Team",
+    "Articulate",
+    "General Willingness Level",
+    "Seva Willingness Level",
+    "Local Center Volunteering",
+    "Ashram Volunteering",
+    "Language Tags & Fluency",
+    "Expertise / Skills",
+    "Learnings from Past Seva Team Notes",
+]
+
+# =====================================================
 # LOGGING SETUP
 # =====================================================
 
@@ -120,6 +154,14 @@ def write_to_google_sheet(df, sheet_url, tab_name, credentials_path):
     try:
         logging.info(f"Safely appending results to: {tab_name}")
 
+        # ── Enforce strict column set & order ──────────────────────────────
+        # Add any missing target columns as empty strings, then keep only them
+        for col in TARGET_COLUMNS:
+            if col not in df.columns:
+                df[col] = ""
+        df = df[TARGET_COLUMNS]
+        # ───────────────────────────────────────────────────────────────────
+
         gc = get_gspread_client(credentials_path)
         sheet = gc.open_by_url(sheet_url)
 
@@ -160,7 +202,7 @@ def write_to_google_sheet(df, sheet_url, tab_name, credentials_path):
 
         new_rows = []
         for row in values:
-            sp_id = str(row[0]).strip()  # assuming SP ID is first column
+            sp_id = str(row[0]).strip()  # SP ID is first column
             if sp_id not in existing_ids:
                 new_rows.append(row)
 
@@ -204,6 +246,9 @@ def main():
         logging.error("No data found.")
         return
 
+    # Build the AI tag list from TARGET_COLUMNS (everything after the first 4 fixed columns)
+    AI_TAG_COLUMNS = TARGET_COLUMNS[4:]
+
     all_records = []
 
     for i, row in df_candidates.iterrows():
@@ -212,21 +257,37 @@ def main():
 
         candidate_dict = row.to_dict()
 
+        tags_list = "\n".join(AI_TAG_COLUMNS)
+
         prompt = f"""
 You are an assistant summarizing candidate profiles.
 
 Candidate JSON:
 {json.dumps(candidate_dict, indent=2)}
 
-Return ONLY a JSON object where each tag has a one-line justification.
-If no info is available, write "No info found".
+Tasks:
+Return ONLY a valid JSON object with exactly these keys (no extra keys):
+{tags_list}
+
+Rules:
+- For "Poornanga": provide a one-line justification.
+- For "Tier City": identify the candidate's city from the data and classify it using this exact format: "<City Name> - Tier <number>".
+  Examples: "Mumbai - Tier 1", "Roorke - Tier 3", "New York - Tier 1", "Minsk - Tier 2".
+  Tier classification guide:
+    Tier 1 = Major global/national metros (Mumbai, Delhi, Bangalore, Chennai, New York, London, Dubai, Shanghai, etc.)
+    Tier 2 = Large regional cities (Pune, Hyderabad, Ahmedabad, Jaipur, Minsk, Düsseldorf, etc.)
+    Tier 3 = Smaller towns and cities (Roorke, Howrah, smaller district towns, etc.)
+  If city is unknown, write "No info found".
+- For all other tags: provide a concise value or assessment.
+- If no info is available for any other tag, write "No info found".
+- Do NOT add any keys beyond the ones listed above.
 """
 
         try:
             response = client.chat.completions.create(
                 model="gpt-4o-mini",
                 messages=[
-                    {"role": "system", "content": "You are a structured data extraction assistant."},
+                    {"role": "system", "content": "You are a structured data extraction assistant. Return only valid JSON with the exact keys requested."},
                     {"role": "user", "content": prompt}
                 ],
                 temperature=0.3
@@ -249,18 +310,23 @@ If no info is available, write "No info found".
                 "Processed Date": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             }
 
-            record.update(ai_tags)
+            # Only pick keys that exist in our TARGET_COLUMNS to avoid extra columns
+            for col in AI_TAG_COLUMNS:
+                record[col] = ai_tags.get(col, "No info found")
+
             all_records.append(record)
 
         except Exception:
             logging.exception(f"Processing failed for SP ID {sp_id}")
-            all_records.append({
+            record = {
                 "SP ID": sp_id,
                 "Name": candidate_dict.get("First Name", ""),
                 "City": candidate_dict.get("City", ""),
                 "Processed Date": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                "Error": "Processing failed"
-            })
+            }
+            for col in AI_TAG_COLUMNS:
+                record[col] = "Processing failed"
+            all_records.append(record)
 
     df_output = pd.DataFrame(all_records)
 
